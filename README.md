@@ -1,1 +1,144 @@
-# Cryogenic-Dilution-Refrigerator-Simulation-Monitoring-System
+# Cryogenic Dilution Refrigerator Simulation & Monitoring System
+
+> **Physics-based 6-stage ODE thermal model + real-time Dash dashboard + ML anomaly detection for a dilution refrigerator achieving 13 mK base temperature**
+
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://python.org)
+[![MATLAB R2023+](https://img.shields.io/badge/MATLAB-R2023+-orange.svg)](https://mathworks.com)
+[![Dash 4](https://img.shields.io/badge/Dash-4.1-green.svg)](https://dash.plotly.com)
+
+---
+
+## Key Results
+
+| Stage | Simulated T | Target | Status |
+|---|---|---|---|
+| 300 K plate | 300 K | 300 K | ✓ |
+| 50 K (PT1) | **43.4 K** | < 50 K | ✓ |
+| 4 K (PT2) | **3.6 K** | < 4.5 K | ✓ |
+| Still | **476 mK** | < 600 mK | ✓ |
+| Cold plate | **33 mK** | < 50 mK | ✓ |
+| MXC (mixing chamber) | **13.2 mK** | < 20 mK | ✓ |
+
+Cool-down from 300 K to 13 mK simulated in **< 3 s** of compute time.
+
+---
+
+## Features
+
+### Physics Model (`python/cryo_thermal.py`, `matlab/thermal_model.m`)
+- 6-stage coupled ODE system (stiff solver: SciPy `Radau` / MATLAB `ode15s`)
+- MXC cooling power: **P = ṅ₃ × L × T²** (Pobell, *Matter and Methods at Low
+  Temperatures*, L = 84 J/mol·K²)
+- ³He circulation rate slider (100–800 µmol/s) scales sub-K cooling power
+  with first-principles formula
+- **Warm-up simulation**: removes cooling power, drives all stages back to 300 K
+  through boundary conduction
+- Configurable heat loads: wiring conduction (24–96 lines), radiation emissivity,
+  qubit dissipation (0–1 µW)
+
+### Real-Time Dashboard (`python/dashboard.py`)
+- **Plotly-native animated cool-down** — 40-frame client-side animation with
+  built-in Play/Pause button and timeline scrubber (no server round-trips)
+- 6 live temperature gauges with colour-coded status (green/amber/red)
+- Sub-Kelvin detail plot (mK scale) with 15 mK target line
+- Heat balance bar chart (cooling power vs heat load, µW, log scale)
+- **Export CSV** button — downloads full simulation time series
+- Anomaly score card updates after every run
+
+### ML Anomaly Detection (`python/anomaly_detector.py`)
+- **Isolation Forest** trained on 500 synthetic cool-down runs
+  (200 normal + 60 × 5 fault modes)
+- **15 features**: log(T_final[stages 1–5]), log(T_at_5h[1–5]),
+  fractional cool-down rate per stage
+- Five injected fault modes:
+  1. PT1 stage failure (50 K conductance −80 %)
+  2. PT2 stage failure (4 K conductance −80 %)
+  3. Still gas leak (+0.2–0.5 W on 4 K stage)
+  4. MXC overheating (qubit power × 200, vibration / RF leakage)
+  5. ³He flow blockage (circulation −80 %)
+- Model cached in `python/anomaly_model.pkl`; loaded in background
+  thread so dashboard starts instantly
+
+### MATLAB (`matlab/`)
+- `thermal_model.m` — same ODE system implemented in MATLAB (`ode15s`)
+- `cooling_power.m` — Pobell T² cooling power per stage
+- `run_analysis.m`, `sensitivity_analysis.m`, `compare_stages.m`
+
+### Jupyter Notebooks (`notebooks/`)
+| Notebook | Content |
+|---|---|
+| `01_Physics_Derivation.ipynb` | ODE derivation, Pobell formula, heat-flow diagram |
+| `02_Steady_State_Analysis.ipynb` | Parameter sweeps, sensitivity analysis |
+| `03_Transient_Analysis.ipynb` | Time-domain cool-down, multi-stage dynamics |
+| `04_ML_Anomaly_Detection.ipynb` | Isolation Forest training, feature importance, ROC |
+
+---
+
+## Quick Start
+
+```bash
+# 1. Install Python dependencies
+pip install -r requirements_dash.txt
+
+# 2. (First time only) train the anomaly model — ~2 min
+python python/anomaly_detector.py
+
+# 3. Run the pipeline (saves CSV + PNG)
+python python/run_pipeline.py
+
+# 4. Launch dashboard
+python python/dashboard.py
+# → http://localhost:8050
+```
+
+---
+
+## Project Structure
+
+```
+Project3_CryoThermal/
+├── python/
+│   ├── cryo_thermal.py        # 6-stage ODE model (simulate_cooldown, simulate_warmup)
+│   ├── anomaly_detector.py    # Isolation Forest fault detection
+│   ├── anomaly_model.pkl      # Cached trained model (500 training samples)
+│   ├── dashboard.py           # Plotly Dash dashboard v2
+│   └── run_pipeline.py        # CLI entry point
+├── matlab/
+│   ├── thermal_model.m        # MATLAB ODE implementation
+│   ├── cooling_power.m        # Pobell T² cooling power
+│   ├── sensitivity_analysis.m
+│   └── compare_stages.m
+├── notebooks/
+│   ├── 01_Physics_Derivation.ipynb
+│   ├── 02_Steady_State_Analysis.ipynb
+│   ├── 03_Transient_Analysis.ipynb
+│   └── 04_ML_Anomaly_Detection.ipynb
+├── outputs/
+│   ├── stage_temperatures.csv
+│   └── cooldown_curve.png
+├── requirements_dash.txt
+└── README.md
+```
+
+---
+
+## Physics Reference
+
+The mixing-chamber cooling power follows the Pobell relation:
+
+$$P_{\text{MXC}} = \dot{n}_3 \cdot L \cdot T^2$$
+
+where $L = 84\ \text{J/(mol·K}^2\text{)}$ and $\dot{n}_3$ is the ³He molar
+circulation rate.  At the nominal 476 µmol/s:
+
+$$A_{\text{MXC}} = 476 \times 10^{-6}\ \frac{\text{mol}}{\text{s}} \times 84\ \frac{\text{J}}{\text{mol·K}^2} = 0.040\ \frac{\text{W}}{\text{K}^2}$$
+
+> Pobell, F. *Matter and Methods at Low Temperatures*, 3rd ed., Springer (2007).
+
+---
+
+## Tech Stack
+
+`Python 3.12` · `SciPy (Radau ODE)` · `NumPy` · `Plotly / Dash 4` ·
+`dash-bootstrap-components` · `scikit-learn (Isolation Forest)` ·
+`MATLAB R2023+` · `Jupyter`

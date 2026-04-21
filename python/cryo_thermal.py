@@ -47,20 +47,17 @@ _C = np.array([1e5, 500.0, 30.0, 3.0, 0.3, 0.03])
 
 # ── Cooling power curves ─────────────────────────────────────────────────────
 
-def cooling_power(stage: int, T: float) -> float:
+def cooling_power(stage: int, T: float, n3_flow_umol: float = 476.0) -> float:
     """
     Cooling power [W] of stage `stage` at temperature `T` [K].
     Analytical fits to Oxford Instruments Triton 400 specs.
 
-    The curves are designed so that P_cool(T) ≈ heat load at the nominal
-    operating temperature, and P_cool ≈ 0 well above that temperature
-    (the pulse tube / dilution unit only provides useful cooling below a
-    certain threshold).
-
     Parameters
     ----------
-    stage : int  — stage index (1=50K, 2=4K, 3=Still, 4=ColdPlate, 5=MXC)
-    T     : float — temperature [K]
+    stage        : int   — stage index (1=50K, 2=4K, 3=Still, 4=ColdPlate, 5=MXC)
+    T            : float — temperature [K]
+    n3_flow_umol : float — ³He circulation rate [µmol/s]; scales sub-K cooling.
+                           Default 476 µmol/s (Oxford Triton 400 nominal).
     """
     T = max(T, 1e-10)   # guard against T≤0
 
@@ -76,22 +73,22 @@ def cooling_power(stage: int, T: float) -> float:
         return max(1.5 * (1.0 - T_base / T), 0.0)
 
     elif stage == 3:
-        # Still (dilution unit): T² law.
-        # A so P(0.7 K) = 20 mW → A = 20e-3/0.49 ≈ 40.8e-3
-        # No upper cutoff: the T² cooling drives the stage from ~4K to 0.7K.
-        return 40.8e-3 * T ** 2
+        # Still (dilution unit): T² law, scales with ³He circulation rate.
+        # P = A_still * T²,  A_still = 40.8e-3 W/K² at n3=476 µmol/s
+        A_still = 40.8e-3 * (n3_flow_umol / 476.0)
+        return A_still * T ** 2
 
     elif stage == 4:
-        # Cold plate: T² law.
-        # A so P(0.1 K) = 2 mW → A = 0.2
-        # No upper cutoff: drives stage from ~0.7K to 0.1K.
-        return 0.2 * T ** 2
+        # Cold plate: T² law, scales with ³He circulation rate.
+        # P = A_cp * T²,  A_cp = 0.2 W/K² at n3=476 µmol/s
+        A_cp = 0.2 * (n3_flow_umol / 476.0)
+        return A_cp * T ** 2
 
     elif stage == 5:
-        # MXC mixing chamber: T² law (osmotic-pressure enthalpy of ³He).
-        # A so P(0.1 K) = 400 µW → A = 0.04  W/K²
-        # No upper cutoff: drives stage from ~0.1K to 15 mK.
-        return 0.04 * T ** 2
+        # MXC: P = n3_dot × L × T²  [Pobell, Matter & Methods ch. 6]
+        # L = 84 J/(mol·K²) — latent heat of ³He mixing at low temperature
+        A_mxc = n3_flow_umol * 1e-6 * 84.0   # W/K²
+        return A_mxc * T ** 2
 
     else:
         return 0.0
@@ -139,7 +136,9 @@ def _dr_ode(t, T, params: dict) -> np.ndarray:
     dTdt[0] = 0.0   # 300 K plate — fixed boundary
 
     # Effective conductance scaling from slider parameters
-    n_w_scale  = params.get("n_wires", 24) / 24.0
+    n_w_scale    = params.get("n_wires", 24) / 24.0
+    n3_flow_umol = params.get("n3_flow_umol", 476.0)   # ³He circulation [µmol/s]
+    warmup_mode  = params.get("warmup_mode",  False)    # True = no active cooling
     # Scale PT-stage conductances with wire count; sub-K stages are dominated
     # by the He-mixture condensate flow (not rescalable by wire count)
     if "G_override" in params:
@@ -155,7 +154,8 @@ def _dr_ode(t, T, params: dict) -> np.ndarray:
     for i in range(1, 6):
         Q_from_above = G[i] * (T[i-1] - T[i])
         Q_to_below   = G[i+1] * (T[i] - T[i+1]) if i < 5 else 0.0
-        Pcool        = cooling_power(i, T[i])
+        Pcool        = (0.0 if warmup_mode
+                        else cooling_power(i, T[i], n3_flow_umol=n3_flow_umol))
         P_qubit      = params.get("P_qubit_W", 5e-6) if i == 5 else 0.0
         P_extra      = P_extra_4K if i == 2 else 0.0   # extra load on 4K stage only
         C_i          = _C[i]
@@ -220,7 +220,8 @@ def heat_balance(T_final: np.ndarray, params: dict | None = None) -> list[dict]:
     if params is None:
         params = {}
 
-    n_w_scale = params.get("n_wires", 24) / 24.0
+    n_w_scale    = params.get("n_wires", 24) / 24.0
+    n3_flow_umol = params.get("n3_flow_umol", 476.0)
     G = _G0.copy()
     G[1] *= n_w_scale
     G[2] *= n_w_scale
@@ -231,12 +232,49 @@ def heat_balance(T_final: np.ndarray, params: dict | None = None) -> list[dict]:
         Q_to_below   = G[i+1] * (T_final[i]   - T_final[i+1]) if i < 5 else 0.0
         Q_net        = Q_from_above - Q_to_below  # net heat into stage i
         P_qubit      = params.get("P_qubit_W", 5e-6) if i == 5 else 0.0
-        Pcool        = cooling_power(i, T_final[i])
-        rows.append({
-            "stage":     STAGE_NAMES[i],
-            "T_K":       T_final[i],
-            "P_cool_W":  Pcool,
-            "Q_in_W":    Q_net + P_qubit,
-            "balance_W": Pcool - (Q_net + P_qubit),
-        })
+        Pcool        = cooling_power(i, T_final[i], n3_flow_umol=n3_flow_umol)
+    rows = rows
     return rows
+
+
+# ── Warm-up simulation ──────────────────────────────────────────────────
+
+def simulate_warmup(
+        t_hours: float = 20.0,
+        params: dict | None = None,
+        n_eval: int = 1000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Simulate DR warm-up from operating temperature back to ~300 K.
+
+    Steps
+    -----
+    1. Run a 10-hour cool-down to reach steady state.
+    2. From that cold initial state, set warmup_mode=True (zero cooling power).
+    3. Run the ODE: conduction from 300 K boundary drives all stages back to 300 K.
+
+    Parameters
+    ----------
+    t_hours : float — warm-up duration [hours]  (15–24 h is typical)
+    params  : dict  — parameter overrides (wire count, emissivity, ³He flow, …)
+    n_eval  : int   — number of output time points
+
+    Returns
+    -------
+    t : (N,) array — time [hours] starting from 0
+    T : (N, 6) array — temperatures [K]
+    """
+    base_params = params or {}
+
+    # 1. Reach steady-state operating temperatures
+    _, T_cold = simulate_cooldown(t_hours=10.0, params=base_params, n_eval=300)
+    T0_warmup = T_cold[-1].copy()
+
+    # 2. Warm up: all cooling disabled, driven purely by conduction
+    warmup_params = base_params.copy()
+    warmup_params["warmup_mode"] = True
+
+    return simulate_cooldown(
+        t_hours=t_hours, T0=T0_warmup,
+        params=warmup_params, n_eval=n_eval,
+    )

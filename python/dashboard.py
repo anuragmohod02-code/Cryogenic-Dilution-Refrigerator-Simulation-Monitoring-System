@@ -4,6 +4,13 @@ dashboard.py
 Plotly Dash web dashboard for the cryogenic dilution refrigerator simulation.
 Reads outputs/stage_temperatures.csv or runs the simulation live.
 
+New in v2:
+  • Plotly-native animated cool-down playback with Play/Pause
+  • ³He circulation rate slider (scales sub-K cooling power)
+  • Warm-up mode simulation toggle
+  • Export CSV download button
+  • ML anomaly-detection score card (Isolation Forest)
+
 Usage:
     python dashboard.py
     → Open http://localhost:8050 in a browser
@@ -11,6 +18,7 @@ Usage:
 
 import os
 import sys
+import threading
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
@@ -18,14 +26,13 @@ sys.path.insert(0, script_dir)
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import dash
-from dash import dcc, html, Input, Output, State, callback_context
+from dash import dcc, html, Input, Output, State, no_update, ctx
 import dash_bootstrap_components as dbc
 
 from cryo_thermal import (
-    simulate_cooldown, heat_balance,
+    simulate_cooldown, simulate_warmup, heat_balance,
     STAGE_NAMES, STAGE_TARGETS_K,
 )
 
@@ -45,6 +52,23 @@ STAGE_COLORS = [
 BG_DARK  = "#1A1A2E"
 BG_CARD  = "#16213E"
 TEXT_CLR = "#E2E8F0"
+
+# ── Anomaly detector (loaded in background thread) ────────────────────────────
+_anomaly_model: dict | None = None
+_anomaly_ready = threading.Event()
+
+def _load_anomaly_model_bg():
+    global _anomaly_model
+    try:
+        from anomaly_detector import load_or_train_model
+        _anomaly_model = load_or_train_model()
+        print("Anomaly detection model ready.")
+    except Exception as e:
+        print(f"Anomaly detection unavailable: {e}")
+    finally:
+        _anomaly_ready.set()
+
+threading.Thread(target=_load_anomaly_model_bg, daemon=True).start()
 
 # ── Load or generate data ─────────────────────────────────────────────────────
 
@@ -177,12 +201,114 @@ def make_heat_balance_bar(T_final: np.ndarray) -> go.Figure:
     return fig
 
 
+def make_animated_cooldown(df: pd.DataFrame, n_frames: int = 40) -> go.Figure:
+    """
+    Plotly-native animated cool-down figure with Play/Pause and time slider.
+    Animation is fully client-side — no server round-trips per frame.
+    """
+    t      = df["time_h"].values
+    T_cols = ["T_300K","T_50K","T_4K","T_still","T_cold_plate","T_mxc"]
+    N      = len(t)
+    ends   = np.linspace(1, N - 1, n_frames, dtype=int)
+
+    # Initial state: show data up to first frame end
+    init = [
+        go.Scatter(x=t[:ends[0]], y=df[col].values[:ends[0]],
+                   name=STAGE_NAMES[i],
+                   line=dict(color=STAGE_COLORS[i], width=2.5), mode="lines")
+        for i, col in enumerate(T_cols)
+    ]
+    fig = go.Figure(data=init)
+
+    # Animation frames (each replaces all 6 traces)
+    frames, slider_steps = [], []
+    for fi, idx in enumerate(ends):
+        frame_data = [
+            go.Scatter(x=t[:idx+1], y=df[col].values[:idx+1])
+            for col in T_cols
+        ]
+        frames.append(go.Frame(data=frame_data, name=str(fi)))
+        slider_steps.append({
+            "args":   [[str(fi)], {"frame":      {"duration": 80, "redraw": True},
+                                   "mode":       "immediate",
+                                   "transition": {"duration": 0}}],
+            "label":  f"{t[idx]:.1f} h",
+            "method": "animate",
+        })
+
+    fig.frames = frames
+
+    fig.update_layout(
+        paper_bgcolor=BG_DARK, plot_bgcolor=BG_CARD, font_color=TEXT_CLR,
+        yaxis=dict(type="log", title="Temperature (K)",
+                   range=[-2.5, 2.5], gridcolor="#2D3748"),
+        xaxis=dict(title="Time (hours)", gridcolor="#2D3748"),
+        height=480,
+        margin=dict(l=60, r=20, t=70, b=90),
+        legend=dict(bgcolor=BG_CARD, bordercolor="#4A5568", borderwidth=1),
+        title=dict(text="Cool-down Transient — Animated (▶ Play below)",
+                   font=dict(color=TEXT_CLR, size=14)),
+        updatemenus=[{
+            "buttons": [
+                {"args": [None, {"frame": {"duration": 80, "redraw": True},
+                                 "fromcurrent": True, "transition": {"duration": 0}}],
+                 "label": "▶  Play", "method": "animate"},
+                {"args": [[None], {"mode": "immediate", "transition": {"duration": 0},
+                                   "frame": {"duration": 0, "redraw": True}}],
+                 "label": "⏸  Pause", "method": "animate"},
+            ],
+            "direction": "left", "pad": {"r": 10, "t": 8},
+            "showactive": True, "type": "buttons",
+            "x": 0.0, "xanchor": "left", "y": 1.14, "yanchor": "top",
+            "bgcolor": "#0F3460", "font": {"color": TEXT_CLR, "size": 13},
+            "bordercolor": "#4A5568",
+        }],
+        sliders=[{
+            "active": n_frames - 1,
+            "yanchor": "top", "xanchor": "left",
+            "currentvalue": {"font": {"size": 12, "color": TEXT_CLR},
+                             "prefix": "t = ", "visible": True, "xanchor": "right"},
+            "transition": {"duration": 0},
+            "pad": {"b": 10, "t": 55}, "len": 0.9, "x": 0.1, "y": 0,
+            "steps": slider_steps,
+            "bgcolor": "#0F3460", "bordercolor": "#4A5568",
+            "font": {"color": TEXT_CLR},
+        }],
+    )
+    return fig
+
+
+def make_subkelvin_plot(df: pd.DataFrame) -> go.Figure:
+    """Sub-Kelvin stages detail on mK scale."""
+    t = df["time_h"].values
+    fig = go.Figure()
+    for i, (col, name, color) in enumerate(zip(
+            ["T_still", "T_cold_plate", "T_mxc"],
+            [STAGE_NAMES[3], STAGE_NAMES[4], STAGE_NAMES[5]],
+            [STAGE_COLORS[3], STAGE_COLORS[4], STAGE_COLORS[5]])):
+        fig.add_trace(go.Scatter(x=t, y=df[col].values * 1e3,
+                                 name=name, line=dict(color=color, width=2.5),
+                                 mode="lines"))
+    fig.add_hline(y=15, line=dict(color="#FFD700", dash="dash", width=1.5),
+                  annotation_text="MXC target 15 mK",
+                  annotation_font_color="#FFD700")
+    fig.update_layout(
+        paper_bgcolor=BG_DARK, plot_bgcolor=BG_CARD, font_color=TEXT_CLR,
+        yaxis=dict(type="log", title="Temperature (mK)", gridcolor="#2D3748"),
+        xaxis=dict(title="Time (hours)", gridcolor="#2D3748"),
+        legend=dict(bgcolor=BG_CARD, bordercolor="#4A5568", borderwidth=1),
+        height=340, margin=dict(l=60, r=20, t=50, b=40),
+        title=dict(text="Sub-Kelvin Stage Detail", font=dict(color=TEXT_CLR)),
+    )
+    return fig
+
+
 # ── App layout ────────────────────────────────────────────────────────────────
 
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.CYBORG],
-    title="Cryo DR Monitor",
+    title="Cryo DR Monitor v2",
 )
 
 def build_layout():
@@ -209,75 +335,130 @@ def build_layout():
             )
         )
 
+    card_style = {"backgroundColor": BG_CARD, "border": "1px solid #2D3748",
+                  "margin": "10px 0"}
+
     layout = dbc.Container([
-        # Header
+        # ── Header ────────────────────────────────────────────────────────────
         dbc.Row([
             dbc.Col(html.H2("🧊 Cryogenic Dilution Refrigerator Monitor",
                             style={"color": "#63B3ED", "marginTop": "16px"})),
-            dbc.Col(
-                dbc.Button("▶ Re-run Simulation", id="run-btn",
+            dbc.Col([
+                dbc.Button("▶ Run Simulation", id="run-btn",
                            color="primary", size="sm",
-                           style={"marginTop": "20px", "float": "right"}),
-                width=3,
-            ),
+                           style={"marginTop": "20px", "marginRight": "8px"}),
+                dbc.Button("⬇ Export CSV", id="export-btn",
+                           color="secondary", size="sm",
+                           style={"marginTop": "20px"}),
+                dcc.Download(id="download-csv"),
+            ], width=4, style={"textAlign": "right"}),
         ], style={"backgroundColor": BG_DARK, "padding": "0 20px"}),
 
         html.Hr(style={"borderColor": "#2D3748"}),
 
-        # Slider controls
+        # ── Slider controls ────────────────────────────────────────────────────
         dbc.Card([
-            dbc.CardHeader("Heat Load Parameters",
+            dbc.CardHeader("Simulation Parameters",
                            style={"color": TEXT_CLR, "backgroundColor": "#0F3460"}),
             dbc.CardBody([
+                # Row 1: heat loads
                 dbc.Row([
                     dbc.Col([
-                        html.Label("# Wires", style={"color": TEXT_CLR}),
+                        html.Label("# Wires (thermal conduction)",
+                                   style={"color": TEXT_CLR, "fontSize": "0.85rem"}),
                         dcc.Slider(id="sl-nwires", min=4, max=96, step=4,
-                                   value=24, marks={4:"4",24:"24",48:"48",96:"96"},
+                                   value=24,
+                                   marks={4:"4", 24:"24", 48:"48", 96:"96"},
                                    tooltip={"placement":"bottom"}),
                     ], width=4),
                     dbc.Col([
-                        html.Label("Emissivity", style={"color": TEXT_CLR}),
+                        html.Label("Shield emissivity",
+                                   style={"color": TEXT_CLR, "fontSize": "0.85rem"}),
                         dcc.Slider(id="sl-emiss", min=0.001, max=0.2, step=0.005,
-                                   value=0.05, marks={0.001:"0.001",0.05:"0.05",0.2:"0.2"},
+                                   value=0.05,
+                                   marks={0.001:"0.001", 0.05:"0.05", 0.2:"0.2"},
                                    tooltip={"placement":"bottom"}),
                     ], width=4),
                     dbc.Col([
-                        html.Label("Qubit Dissipation (nW)", style={"color": TEXT_CLR}),
+                        html.Label("Qubit dissipation (nW)",
+                                   style={"color": TEXT_CLR, "fontSize": "0.85rem"}),
                         dcc.Slider(id="sl-qubit", min=0, max=1000, step=10,
-                                   value=100, marks={0:"0",100:"100",500:"500",1000:"1000"},
+                                   value=100,
+                                   marks={0:"0", 100:"100", 500:"500", 1000:"1000"},
                                    tooltip={"placement":"bottom"}),
                     ], width=4),
+                ], style={"marginBottom": "10px"}),
+                # Row 2: ³He flow + warm-up toggle
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("³He circulation rate (µmol/s)",
+                                   style={"color": TEXT_CLR, "fontSize": "0.85rem"}),
+                        dcc.Slider(id="sl-n3flow", min=100, max=800, step=20,
+                                   value=476,
+                                   marks={100:"100", 476:"476 ★", 800:"800"},
+                                   tooltip={"placement":"bottom"}),
+                    ], width=6),
+                    dbc.Col([
+                        html.Div([
+                            html.Label("Warm-up simulation",
+                                       style={"color": TEXT_CLR, "fontSize": "0.85rem",
+                                              "marginRight": "10px"}),
+                            dbc.Switch(id="sw-warmup", value=False,
+                                       label="",
+                                       style={"display": "inline-block"}),
+                        ], style={"marginTop": "22px"}),
+                    ], width=3),
+                    dbc.Col([
+                        html.Div(id="anomaly-card",
+                                 children="Anomaly detection: loading…",
+                                 style={"color": "#F39C12", "fontFamily": "monospace",
+                                        "fontSize": "0.85rem", "marginTop": "20px",
+                                        "padding": "6px 10px",
+                                        "border": "1px solid #4A5568",
+                                        "borderRadius": "6px",
+                                        "backgroundColor": BG_DARK}),
+                    ], width=3),
                 ]),
             ], style={"backgroundColor": BG_CARD}),
         ], style={"margin": "10px 0"}),
 
-        # Status bar
+        # ── Status bar ─────────────────────────────────────────────────────────
         html.Div(id="status-bar",
                  children=f"Loaded data — MXC = {T_final[5]*1e3:.2f} mK",
                  style={"color": "#2ECC71", "padding": "6px 0",
                         "fontFamily": "monospace"}),
 
-        # Temperature gauges
+        # ── Temperature gauges ─────────────────────────────────────────────────
         dbc.Row(gauge_cards, style={"margin": "8px 0"}),
 
-        # Cool-down plot
+        # ── Animated cool-down plot ────────────────────────────────────────────
         dbc.Card([
             dbc.CardBody(dcc.Graph(id="cooldown-plot",
-                                   figure=make_cooldown_plot(df),
+                                   figure=make_animated_cooldown(df),
                                    config={"displayModeBar": True}))
-        ], style={"backgroundColor": BG_CARD, "border": "1px solid #2D3748",
-                  "margin": "10px 0"}),
+        ], style=card_style),
 
-        # Heat balance bar
-        dbc.Card([
-            dbc.CardBody(dcc.Graph(id="heat-balance-plot",
-                                   figure=make_heat_balance_bar(T_final),
-                                   config={"displayModeBar": False}))
-        ], style={"backgroundColor": BG_CARD, "border": "1px solid #2D3748",
-                  "margin": "10px 0"}),
+        # ── Sub-K zoom + heat balance (side by side) ───────────────────────────
+        dbc.Row([
+            dbc.Col(
+                dbc.Card([
+                    dbc.CardBody(dcc.Graph(id="subkelvin-plot",
+                                           figure=make_subkelvin_plot(df),
+                                           config={"displayModeBar": False}))
+                ], style=card_style),
+                width=6,
+            ),
+            dbc.Col(
+                dbc.Card([
+                    dbc.CardBody(dcc.Graph(id="heat-balance-plot",
+                                           figure=make_heat_balance_bar(T_final),
+                                           config={"displayModeBar": False}))
+                ], style=card_style),
+                width=6,
+            ),
+        ]),
 
-        # Store for simulation data
+        # ── Hidden stores ──────────────────────────────────────────────────────
         dcc.Store(id="sim-data-store"),
 
     ], fluid=True, style={"backgroundColor": BG_DARK, "minHeight": "100vh",
@@ -292,49 +473,104 @@ app.layout = build_layout()
 
 @app.callback(
     Output("cooldown-plot",    "figure"),
+    Output("subkelvin-plot",   "figure"),
     Output("heat-balance-plot","figure"),
     Output("status-bar",       "children"),
     Output("status-bar",       "style"),
+    Output("anomaly-card",     "children"),
+    Output("anomaly-card",     "style"),
+    Output("sim-data-store",   "data"),
     *[Output(f"gauge-{i}", "figure") for i in range(6)],
-    Input("run-btn",   "n_clicks"),
-    State("sl-nwires", "value"),
-    State("sl-emiss",  "value"),
-    State("sl-qubit",  "value"),
+    Input("run-btn",     "n_clicks"),
+    State("sl-nwires",   "value"),
+    State("sl-emiss",    "value"),
+    State("sl-qubit",    "value"),
+    State("sl-n3flow",   "value"),
+    State("sw-warmup",   "value"),
     prevent_initial_call=True,
 )
-def run_simulation(n_clicks, n_wires, emissivity, qubit_nW):
+def run_simulation(n_clicks, n_wires, emissivity, qubit_nW, n3_flow, warmup_on):
+    base_style   = {"fontFamily": "monospace", "padding": "6px 10px",
+                    "border": "1px solid #4A5568", "borderRadius": "6px",
+                    "fontSize": "0.85rem", "backgroundColor": BG_DARK}
+
     params = {
-        "n_wires":    int(n_wires),
-        "emissivity": float(emissivity),
-        "P_qubit_W":  float(qubit_nW) * 1e-9,
+        "n_wires":      int(n_wires),
+        "emissivity":   float(emissivity),
+        "P_qubit_W":    float(qubit_nW) * 1e-9,
+        "n3_flow_umol": float(n3_flow),
     }
     try:
-        t_h, T = simulate_cooldown(params=params, n_eval=2000)
+        if warmup_on:
+            t_h, T = simulate_warmup(t_hours=20.0, params=params, n_eval=1500)
+            mode_label = "Warm-up"
+        else:
+            t_h, T = simulate_cooldown(params=params, n_eval=2000)
+            mode_label = "Cool-down"
     except Exception as e:
         err_style = {"color": "#E74C3C", "padding": "6px 0",
                      "fontFamily": "monospace"}
         empty = go.Figure()
         empty.update_layout(paper_bgcolor=BG_DARK, plot_bgcolor=BG_CARD,
                             font_color=TEXT_CLR)
-        gauges = [empty] * 6
-        return empty, empty, f"Error: {e}", err_style, *gauges
+        return (empty, empty, empty, f"Error: {e}", err_style,
+                "Anomaly: n/a", {**base_style, "color": "#888888"},
+                None, *([empty] * 6))
 
     T_cols = ["T_300K","T_50K","T_4K","T_still","T_cold_plate","T_mxc"]
-    df = pd.DataFrame(np.column_stack([t_h, T]), columns=["time_h"] + T_cols)
+    df      = pd.DataFrame(np.column_stack([t_h, T]),
+                           columns=["time_h"] + T_cols)
     T_final = T[-1]
     mxc_mK  = T_final[5] * 1e3
 
-    ok_style = {"color": "#2ECC71" if mxc_mK < 20 else "#F39C12",
-                "padding": "6px 0", "fontFamily": "monospace"}
-    status = (f"Simulation complete — MXC = {mxc_mK:.2f} mK | "
-              f"Wires={n_wires}, ε={emissivity:.3f}, P_qubit={qubit_nW:.0f} nW")
+    # ── Status
+    ok_col  = "#2ECC71" if mxc_mK < 20 else "#F39C12"
+    ok_style = {"color": ok_col, "padding": "6px 0", "fontFamily": "monospace"}
+    status   = (f"{mode_label} complete — MXC = {mxc_mK:.2f} mK | "
+                f"Wires={n_wires}, ε={emissivity:.3f}, "
+                f"P_q={qubit_nW:.0f} nW, ṅ₃={n3_flow:.0f} µmol/s")
 
+    # ── Anomaly score
+    if not warmup_on and _anomaly_ready.is_set() and _anomaly_model is not None:
+        from anomaly_detector import score_simulation as _score
+        res = _score(_anomaly_model, t_h, T)
+        a_text  = f"{res['label']}  (score {res['pct']}%)"
+        a_color = "#E74C3C" if res["is_anomaly"] else "#2ECC71"
+    elif not _anomaly_ready.is_set():
+        a_text, a_color = "Anomaly model: training…", "#F39C12"
+    else:
+        a_text, a_color = "Anomaly: n/a (warm-up mode)", "#888888"
+
+    anomaly_card_style = {**base_style, "color": a_color}
+
+    # ── Gauges
     gauges = [
         make_gauge(STAGE_NAMES[i], T_final[i], STAGE_TARGETS_K[i], STAGE_COLORS[i])
         for i in range(6)
     ]
-    return (make_cooldown_plot(df), make_heat_balance_bar(T_final),
-            status, ok_style, *gauges)
+
+    return (
+        make_animated_cooldown(df),
+        make_subkelvin_plot(df),
+        make_heat_balance_bar(T_final),
+        status, ok_style,
+        a_text, anomaly_card_style,
+        df.to_dict("records"),
+        *gauges,
+    )
+
+
+@app.callback(
+    Output("download-csv", "data"),
+    Input("export-btn",    "n_clicks"),
+    State("sim-data-store","data"),
+    prevent_initial_call=True,
+)
+def export_csv(n_clicks, store_data):
+    if not store_data:
+        return no_update
+    df = pd.DataFrame(store_data)
+    return dcc.send_data_frame(df.to_csv, "dr_cooldown.csv", index=False)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
