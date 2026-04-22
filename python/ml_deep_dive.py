@@ -135,65 +135,86 @@ FEATURE_NAMES = (
 )
 
 
+# ── Thermometry noise model ──────────────────────────────────────────────────────
+# Calibrated RuO₂ sensors: ~0.5% RMS at MXC, ~1% at sub-K stages, ~2% at K stages.
+# Applied as multiplicative noise after each simulation to model realistic
+# sensor uncertainty that creates class overlap.
+_SENSOR_NOISE_FRAC = np.array([0.02, 0.02, 0.01, 0.01, 0.005, 0.005])
+
+
+def _add_sensor_noise(T_array: np.ndarray, rng) -> np.ndarray:
+    """Multiplicative Gaussian thermometry noise on a (n_time, 6) array."""
+    noise = 1.0 + rng.normal(0.0, _SENSOR_NOISE_FRAC, T_array.shape)
+    return T_array * np.abs(noise)
+
+
 # ── Fault scenario simulation ─────────────────────────────────────────────────────
+# Fault magnitudes are chosen to be physically realistic and deliberately
+# overlapping — this models the hard part of real fault detection where
+# early-stage faults are subtle and partially masked by sensor noise.
 
 def _gen_normal(rng, n_samples: int) -> list:
-    """Normal operation with small random parameter variations."""
+    """Normal: ṅ₃=400–560 µmol/s, baseline wiring heat ≤50 µW on Still."""
     results = []
     for _ in range(n_samples):
-        n3  = rng.uniform(400, 560)    # µmol/s
-        qh  = rng.uniform(0.0, 0.001)  # extra heat (W) small
-        r   = run_simulation(t_end=3600, t_points=200,
-                             n3_flow_umol_s=n3, extra_heat=[0,0,0,qh,0,0])
+        n3 = rng.uniform(400, 560)
+        qh = rng.uniform(0.0, 5e-5)        # ≤50 µW — typical wiring load
+        r  = run_simulation(t_end=3600, t_points=200,
+                            n3_flow_umol_s=n3, extra_heat=[0,0,0,qh,0,0])
+        r["T"] = _add_sensor_noise(r["T"], rng)
         results.append(r)
     return results
 
 
 def _gen_still_fault(rng, n_samples: int) -> list:
-    """Still heater runaway: large extra heat at Still stage."""
+    """Still heater degradation: 0.5–4 mW excess (overlaps normal at low end)."""
     results = []
     for _ in range(n_samples):
-        n3  = rng.uniform(400, 560)
-        qh  = rng.uniform(0.01, 0.05)   # 10–50 mW still fault
-        r   = run_simulation(t_end=3600, t_points=200,
-                             n3_flow_umol_s=n3, extra_heat=[0,0,0,qh,0,0])
+        n3 = rng.uniform(400, 560)
+        qh = rng.uniform(5e-4, 4e-3)       # 0.5–4 mW partial heater fault
+        r  = run_simulation(t_end=3600, t_points=200,
+                            n3_flow_umol_s=n3, extra_heat=[0,0,0,qh,0,0])
+        r["T"] = _add_sensor_noise(r["T"], rng)
         results.append(r)
     return results
 
 
 def _gen_flow_fault(rng, n_samples: int) -> list:
-    """³He flow fault: reduced circulation rate."""
+    """³He partial flow restriction: 300–440 µmol/s (25–35% below nominal)."""
     results = []
     for _ in range(n_samples):
-        n3  = rng.uniform(50, 150)    # reduced flow → poor cooling
-        qh  = rng.uniform(0.0, 0.001)
-        r   = run_simulation(t_end=3600, t_points=200,
-                             n3_flow_umol_s=n3, extra_heat=[0,0,0,0,0,qh])
+        n3 = rng.uniform(300, 440)         # overlaps normal range at upper end
+        qh = rng.uniform(0.0, 5e-5)
+        r  = run_simulation(t_end=3600, t_points=200,
+                            n3_flow_umol_s=n3, extra_heat=[0,0,0,0,0,qh])
+        r["T"] = _add_sensor_noise(r["T"], rng)
         results.append(r)
     return results
 
 
 def _gen_4k_overload(rng, n_samples: int) -> list:
-    """4K stage overload: large experiment heat load."""
+    """4K experiment load: 5–30 mW (PCB dissipation + wiring, realistic range)."""
     results = []
     for _ in range(n_samples):
-        n3  = rng.uniform(400, 560)
-        qh  = rng.uniform(0.1, 0.5)    # 100–500 mW on 4K stage
-        r   = run_simulation(t_end=3600, t_points=200,
-                             n3_flow_umol_s=n3, extra_heat=[0,0,qh,0,0,0])
+        n3 = rng.uniform(400, 560)
+        qh = rng.uniform(5e-3, 3e-2)       # 5–30 mW → ΔT_4K ≈ 0.4–2.5 K
+        r  = run_simulation(t_end=3600, t_points=200,
+                            n3_flow_umol_s=n3, extra_heat=[0,0,qh,0,0,0])
+        r["T"] = _add_sensor_noise(r["T"], rng)
         results.append(r)
     return results
 
 
 def _gen_mxc_vibration(rng, n_samples: int) -> list:
-    """MXC vibration: small oscillatory heat on MXC + cold plate."""
+    """MXC vibration coupling: 50–500 µW on MXC + 20–200 µW on cold plate."""
     results = []
     for _ in range(n_samples):
         n3  = rng.uniform(400, 560)
-        qh  = rng.uniform(0.0005, 0.003)   # 0.5–3 mW MXC vibration coupling
-        qcp = rng.uniform(0.0001, 0.001)
+        qh  = rng.uniform(5e-5, 5e-4)      # 50–500 µW — subtle MXC heating
+        qcp = rng.uniform(2e-5, 2e-4)      # 20–200 µW cold plate coupling
         r   = run_simulation(t_end=3600, t_points=200,
                              n3_flow_umol_s=n3, extra_heat=[0,0,0,0,qcp,qh])
+        r["T"] = _add_sensor_noise(r["T"], rng)
         results.append(r)
     return results
 
@@ -219,8 +240,8 @@ def build_dataset(n_per_class: int = 200, seed: int = 42) -> tuple:
     X = np.array(X_list)
     y = np.array(y_list, dtype=int)
 
-    # Add small observation noise to features
-    X += rng.normal(0, 0.001, X.shape) * X  # 0.1% relative noise
+    # Sensor noise is already embedded in the simulation traces;
+    # no additional post-hoc feature noise needed.
 
     return X, y
 

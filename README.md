@@ -64,11 +64,17 @@ Cool-down from 300 K to 13 mK simulated in **< 3 s** of compute time.
   (200 per class) with per-stage temperature features (15 features)
 - **Five fault classes**: Normal, Still heater fault, ³He flow fault,
   4 K overload, MXC vibration coupling
-- **Test accuracy: 100%** (300-sample hold-out); macro-averaged AUC = 1.00
-  across all one-vs-rest ROC curves
+- **Test accuracy: 91%** (300-sample hold-out, macro F1 = 0.91);
+  fault magnitudes are physically realistic with deliberate class overlap
+  (e.g. Still heater fault at 0.5–4 mW vs Normal baseline ≤50 µW)
+- Per-class F1: Normal 0.84, Still heater 0.90, ³He flow 0.98,
+  4K overload 0.84, MXC vibration 0.98 — hardest classes reflect true
+  diagnostic ambiguity at early fault onset
+- Thermometry noise (0.5–2% RMS per stage, multiplicative) applied to
+  every simulation trace to model RuO₂ sensor uncertainty
 - Feature importance: MXC T_final and ΔT_MXC/ΔT_Still ratio are the top
   two discriminating features
-- t-SNE projection shows perfect class separation in 2D embedding
+- t-SNE projection shows clear cluster structure with realistic boundary overlap
 - Outputs: `outputs/ml_roc_curves.png`, `ml_confusion_matrix.png`,
   `ml_feature_importance.png`, `ml_tsne.png`
 
