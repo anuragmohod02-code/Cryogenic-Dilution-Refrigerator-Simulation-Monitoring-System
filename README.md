@@ -1,6 +1,6 @@
 # Cryogenic Dilution Refrigerator Simulation & Monitoring System
 
-> **Physics-based 6-stage ODE thermal model + real-time Dash dashboard + ML anomaly detection for a dilution refrigerator achieving 13 mK base temperature**
+> **Physics-based 6-stage ODE thermal model + real-time Dash dashboard + 5-class ML fault classifier + PID feedback control + MXC parameter sweep for a dilution refrigerator achieving 13 mK base temperature**
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://python.org)
 [![MATLAB R2023+](https://img.shields.io/badge/MATLAB-R2023+-orange.svg)](https://mathworks.com)
@@ -59,6 +59,44 @@ Cool-down from 300 K to 13 mK simulated in **< 3 s** of compute time.
 - Model cached in `python/anomaly_model.pkl`; loaded in background
   thread so dashboard starts instantly
 
+### 5-Class Fault Classifier (`python/ml_deep_dive.py`) *(v2)*
+- **Random Forest** (200 estimators) trained on 1 000 synthetic runs
+  (200 per class) with per-stage temperature features (15 features)
+- **Five fault classes**: Normal, Still heater fault, ³He flow fault,
+  4 K overload, MXC vibration coupling
+- **Test accuracy: 100%** (300-sample hold-out); macro-averaged AUC = 1.00
+  across all one-vs-rest ROC curves
+- Feature importance: MXC T_final and ΔT_MXC/ΔT_Still ratio are the top
+  two discriminating features
+- t-SNE projection shows perfect class separation in 2D embedding
+- Outputs: `outputs/ml_roc_curves.png`, `ml_confusion_matrix.png`,
+  `ml_feature_importance.png`, `ml_tsne.png`
+
+### PID Feedback Controller (`python/pid_controller.py`) *(v2)*
+- **Digital PID** with anti-windup clamping; ZOH at 1 Hz matching a
+  realistic embedded controller
+- Tuning: Kp = 50, Ki = 0.05, Kd = 200 (Still heater → MXC setpoint)
+- **Setpoint step** 15 mK → 25 mK → 15 mK: settles within ~8 min, zero
+  steady-state error
+- **Disturbance rejection**: 3 mW heat pulse on MXC (300 s) — recovered
+  in < 5 min with < 2 mK overshoot
+- **Kp sweep** (10 / 50 / 150 / 400): overdamped → critically damped →
+  underdamped response clearly visible
+- Outputs: `outputs/pid_step_response.png`, `pid_disturbance.png`,
+  `pid_kp_sweep.png`
+
+### MXC Temperature Parameter Sweep (`python/mxc_temp_sweep.py`) *(v2)*
+- Sweeps ³He circulation rate ṅ₃ over **50–700 µmol/s** (27 points),
+  extracting steady-state temperature from the 6-stage ODE
+- Overlays **Pobell T² analytical prediction**:
+  $T_{\text{MXC}} = \sqrt{Q_{\text{load}} / (84 \cdot \dot{n}_3)}$
+- Log-log plot confirms slope −½ scaling over full range
+- Family-of-curves for Q_load = 0, 1, 5, 10, 20 µW heat loads
+- At nominal 476 µmol/s: T_MXC,sim = 12.8 mK vs Pobell = 7.1 mK
+  (factor ~1.8 offset from additional still/cold-plate heat leaks)
+- Outputs: `outputs/mxc_temp_vs_n3flow.png`, `stage_temps_vs_n3flow.png`,
+  `mxc_family_curves.png`
+
 ### MATLAB (`matlab/`)
 - `thermal_model.m` — same ODE system implemented in MATLAB (`ode15s`)
 - `cooling_power.m` — Pobell T² cooling power per stage
@@ -102,6 +140,9 @@ Project3_CryoThermal/
 │   ├── anomaly_detector.py    # Isolation Forest fault detection
 │   ├── anomaly_model.pkl      # Cached trained model (500 training samples)
 │   ├── dashboard.py           # Plotly Dash dashboard v2
+│   ├── ml_deep_dive.py        # 5-class RF fault classifier (v2)
+│   ├── pid_controller.py      # Digital PID — Still heater → MXC setpoint (v2)
+│   ├── mxc_temp_sweep.py      # MXC T vs ṅ₃ sweep + Pobell T² overlay (v2)
 │   └── run_pipeline.py        # CLI entry point
 ├── matlab/
 │   ├── thermal_model.m        # MATLAB ODE implementation
@@ -140,5 +181,5 @@ $$A_{\text{MXC}} = 476 \times 10^{-6}\ \frac{\text{mol}}{\text{s}} \times 84\ \f
 ## Tech Stack
 
 `Python 3.12` · `SciPy (Radau ODE)` · `NumPy` · `Plotly / Dash 4` ·
-`dash-bootstrap-components` · `scikit-learn (Isolation Forest)` ·
+`dash-bootstrap-components` · `scikit-learn (Isolation Forest + Random Forest)` ·
 `MATLAB R2023+` · `Jupyter`
