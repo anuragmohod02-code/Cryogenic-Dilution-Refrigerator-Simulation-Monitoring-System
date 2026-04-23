@@ -1,6 +1,6 @@
 # Cryogenic Dilution Refrigerator Simulation & Monitoring System
 
-> **Physics-based 6-stage ODE thermal model + real-time Dash dashboard + 5-class ML fault classifier + PID feedback control + MXC parameter sweep for a dilution refrigerator achieving 13 mK base temperature**
+> **Physics-based 6-stage ODE thermal model + real-time Dash dashboard + 5-class ML fault classifier + PID feedback control + MXC parameter sweep + Bayesian fault posterior + cooldown predictor for a dilution refrigerator achieving 13 mK base temperature**
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://python.org)
 [![MATLAB R2023+](https://img.shields.io/badge/MATLAB-R2023+-orange.svg)](https://mathworks.com)
@@ -78,6 +78,37 @@ Cool-down from 300 K to 13 mK simulated in **< 3 s** of compute time.
 - Outputs: `outputs/ml_roc_curves.png`, `ml_confusion_matrix.png`,
   `ml_feature_importance.png`, `ml_tsne.png`
 
+### Bayesian Posterior Fault Diagnosis (`python/bayesian_fault_classifier.py`) *(v3)*
+- Extends RF `predict_proba` output as Bayesian posterior P(fault | sensor data)
+  under a flat prior — physically motivated: operator needs posterior, not point label
+- **5 representative case studies**: posterior bar charts with true class highlighted,
+  entropy annotation per case
+- **Calibration / reliability diagram**: per-class OvR calibration curves confirm
+  that RF posterior probabilities match empirical frequencies
+- **Shannon entropy H** used to flag ambiguous fault states
+  (H close to ln 5 = 1.61 nats → manual inspection warranted)
+- Key results:
+  - Test accuracy: 91.0%
+  - Mean H = 0.397 nats (max = 1.609); 63.3% of predictions have H < 0.5 (confident)
+  - ³He flow fault and MXC vibration are highest-confidence classes (H = 0.16–0.15)
+  - Normal and 4K overload show highest diagnostic uncertainty (H = 0.72–0.63)
+- Output: `outputs/14_bayesian_posterior.png`
+
+### Cooldown Time Predictor (`python/cooldown_predictor.py`) *(v3)*
+- Uses `simulate_cooldown` ODE to predict time-to-base (T_MXC < 20 mK) from
+  a 300 K warm start as a function of operating parameters
+- **4-panel figure**:
+  1. Full 6-stage cooldown trajectory (log-scale)
+  2. MXC approach to base temperature (mK, annotated)
+  3. Heatmap: time-to-base vs (ṅ₃, P_qubit) — reveals critical operating envelope
+  4. Dual-axis sensitivity: T_MXC at t=10 h vs each parameter independently
+- **Key findings** (nominal: ṅ₃ = 476 µmol/s, P_qubit = 5 µW):
+  - T_MXC at t=12 h = **13.22 mK** (below 20 mK target) ✔
+  - P_qubit ≥ 20 µW prevents reaching base T within 14 h at any flow rate
+  - Reducing flow to 250 µmol/s raises steady-state T_MXC to 19.8 mK (borderline)
+  - At 200 µW qubit dissipation: T_MXC stabilises at 70 mK (5.3× above target)
+- Output: `outputs/15_cooldown_predictor.png`
+
 ### PID Feedback Controller (`python/pid_controller.py`) *(v2)*
 - **Digital PID** with anti-windup clamping; ZOH at 1 Hz matching a
   realistic embedded controller
@@ -148,8 +179,8 @@ Project3_CryoThermal/
 │   ├── dashboard.py           # Plotly Dash dashboard v2
 │   ├── ml_deep_dive.py        # 5-class RF fault classifier (v2)
 │   ├── pid_controller.py      # Digital PID — Still heater → MXC setpoint (v2)
-│   ├── mxc_temp_sweep.py      # MXC T vs ṅ₃ sweep + Pobell T² overlay (v2)
-│   └── run_pipeline.py        # CLI entry point
+│   ├── mxc_temp_sweep.py      # MXC T vs ṅ₃ sweep + Pobell T² overlay (v2)   ├── bayesian_fault_classifier.py  # Bayesian posterior fault diagnosis (v3)
+   ├── cooldown_predictor.py  # Time-to-base heatmap + sensitivity analysis (v3)│   └── run_pipeline.py        # CLI entry point
 ├── matlab/
 │   ├── thermal_model.m        # MATLAB ODE implementation
 │   ├── cooling_power.m        # Pobell T² cooling power
@@ -162,10 +193,21 @@ Project3_CryoThermal/
 │   └── 04_ML_Anomaly_Detection.ipynb
 ├── outputs/
 │   ├── stage_temperatures.csv
-│   └── cooldown_curve.png
+│   ├── cooldown_curve.png
+│   ├── 14_bayesian_posterior.png   # Bayesian fault posteriors + calibration (v3)
+│   └── 15_cooldown_predictor.png  # Cooldown time heatmap + sensitivity (v3)
 ├── requirements_dash.txt
 └── README.md
 ```
+
+---
+
+## References
+
+1. Pobell F., *Matter and Methods at Low Temperatures*, 3rd ed., Springer (2007) — ch. 6 dilution refrigeration
+2. Pedregosa et al., JMLR 12 (2011) — scikit-learn
+3. Niculescu-Mizil & Caruana, *Predicting Good Probabilities with Supervised Learning*, ICML 2005 — classifier calibration
+4. van der Maaten & Hinton, JMLR 9 (2008) — t-SNE
 
 ---
 
